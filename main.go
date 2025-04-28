@@ -1,7 +1,8 @@
 package main
 
 import (
-	"bufio"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,144 +12,155 @@ import (
 	"github.com/fatih/color"
 )
 
+var (
+	branch1   string
+	branch2   string
+	format    string
+	separator string
+	noColor   bool
+)
+
+func init() {
+	flag.StringVar(&branch1, "branch1", "", "First branch to compare (required)")
+	flag.StringVar(&branch2, "branch2", "", "Second branch to compare (required)")
+	flag.StringVar(&format, "format", "text", "Output format: text, json, custom")
+	flag.StringVar(&separator, "separator", "\n", "Separator for custom output format")
+	flag.BoolVar(&noColor, "no-color", false, "Disable color output")
+}
+
 func main() {
-	if len(os.Args) != 3 {
-		color.Red("Usage: diffstat <main branch> <feature branch>")
-		os.Exit(1)
+	flag.Parse()
+
+	if branch1 == "" || branch2 == "" {
+		outputError("Both --branch1 and --branch2 are required")
 	}
 
-	branch1 := os.Args[1]
-	branch2 := os.Args[2]
+	// Configure color output
+	if format != "text" {
+		color.NoColor = true
+	} else {
+		color.NoColor = noColor
+	}
 
-	// We now count the total lines in the target branch (branch2) rather than the working directory.
-	totalLines, err := getTotalLines(branch2)
+	totalLines, err := getTotalLines()
 	if err != nil {
-		color.Red("Error calculating total lines: %v", err)
-		os.Exit(1)
+		outputError(fmt.Sprintf("Error calculating total lines: %v", err))
 	}
 
 	changedLines, err := getChangedLines(branch1, branch2)
 	if err != nil {
-		color.Red("Error calculating changed lines: %v", err)
-		os.Exit(1)
+		outputError(fmt.Sprintf("Error calculating changed lines: %v", err))
 	}
 
-	if changedLines == 0 {
+	if changedLines == 0 && format == "text" {
 		color.Green("No changes between the branches.")
 		return
 	}
 
-	percentageChange := float64(changedLines) / float64(totalLines) * 100
+	var percentageChange float64
+	if totalLines > 0 {
+		percentageChange = float64(changedLines) / float64(totalLines) * 100
+	}
 
-	fmt.Printf("Total lines in branch %s: %s\n", branch2, color.CyanString("%d", totalLines))
-	fmt.Printf("Lines changed between %s and %s: %s\n", branch1, branch2, color.YellowString("%d", changedLines))
-	fmt.Printf("Percentage of change: %s\n", color.GreenString("%.2f%%", percentageChange))
+	switch format {
+	case "text":
+		fmt.Printf("Total lines in repository: %s\n", color.CyanString("%d", totalLines))
+		fmt.Printf("Lines changed between %s and %s: %s\n", branch1, branch2, color.YellowString("%d", changedLines))
+		fmt.Printf("Percentage of change: %s\n", color.GreenString("%.2f%%", percentageChange))
+	case "json":
+		out := struct {
+			TotalLines   int     `json:"totalLines"`
+			ChangedLines int     `json:"changedLines"`
+			Percentage   float64 `json:"percentage"`
+			Branch1      string  `json:"branch1"`
+			Branch2      string  `json:"branch2"`
+		}{
+			TotalLines:   totalLines,
+			ChangedLines: changedLines,
+			Percentage:   percentageChange,
+			Branch1:      branch1,
+			Branch2:      branch2,
+		}
+		jsonData, err := json.Marshal(out)
+		if err != nil {
+			outputError(fmt.Sprintf("Error generating JSON: %v", err))
+		}
+		fmt.Println(string(jsonData))
+	case "custom":
+		parts := []string{
+			strconv.Itoa(totalLines),
+			strconv.Itoa(changedLines),
+			fmt.Sprintf("%.2f", percentageChange),
+			branch1,
+			branch2,
+		}
+		fmt.Println(strings.Join(parts, separator))
+	default:
+		outputError("Invalid output format specified")
+	}
 }
 
-// getTotalLines returns the total number of lines in all files of the given branch.
-func getTotalLines(branch string) (int, error) {
-	// List all files tracked in the given branch.
-	out, err := exec.Command("git", "ls-tree", "-r", "--name-only", branch).Output()
+func outputError(message string) {
+	switch format {
+	case "json":
+		errJSON := struct {
+			Error string `json:"error"`
+		}{
+			Error: message,
+		}
+		jsonData, _ := json.Marshal(errJSON)
+		fmt.Println(string(jsonData))
+	default:
+		color.Red(message)
+	}
+	os.Exit(1)
+}
+
+func getTotalLines() (int, error) {
+	out, err := exec.Command("git", "ls-files").Output()
 	if err != nil {
 		return 0, err
 	}
+
 	files := strings.Split(strings.TrimSpace(string(out)), "\n")
 	totalLines := 0
 
 	for _, file := range files {
-		// Get file content from the branch
-		content, err := exec.Command("git", "show", branch+":"+file).Output()
+		out, err := exec.Command("wc", "-l", file).Output()
 		if err != nil {
-			// If file is binary or cannot be retrieved, skip it
-			continue
+			return 0, err
 		}
-		// Count the number of lines
-		lines := strings.Split(string(content), "\n")
-		totalLines += len(lines)
+		lines, err := strconv.Atoi(strings.Fields(string(out))[0])
+		if err != nil {
+			return 0, err
+		}
+		totalLines += lines
 	}
 
 	return totalLines, nil
 }
 
-// getChangedLines calculates the number of changed lines between branch1 and branch2.
 func getChangedLines(branch1, branch2 string) (int, error) {
-	out, err := exec.Command("git", "diff", "--numstat", branch1, branch2).Output()
+	out, err := exec.Command("git", "diff", "--stat", branch1, branch2).Output()
 	if err != nil {
 		return 0, err
 	}
 
-	totalChanges := 0
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			continue
-		}
-
-		addedStr, deletedStr := fields[0], fields[1]
-
-		if addedStr == "-" || deletedStr == "-" {
-			// Handle binary or new/deleted files
-			totalChanges += estimateBinaryOrNewFileChange(branch1, branch2, fields[2])
-		} else {
-			// Convert to integers
-			a, err := strconv.Atoi(addedStr)
-			if err != nil {
-				return 0, fmt.Errorf("failed to parse added lines: %s", addedStr)
-			}
-			d, err := strconv.Atoi(deletedStr)
-			if err != nil {
-				return 0, fmt.Errorf("failed to parse deleted lines: %s", deletedStr)
-			}
-			totalChanges += a + d
-		}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 {
+		return 0, nil
 	}
-	if err := scanner.Err(); err != nil {
+	lastLine := lines[len(lines)-1]
+
+	fields := strings.Fields(lastLine)
+	if len(fields) < 1 {
+		return 0, nil
+	}
+
+	changedLines, err := strconv.Atoi(fields[0])
+	if err != nil {
 		return 0, err
 	}
 
-	return totalChanges, nil
-}
-
-// estimateBinaryOrNewFileChange estimates line changes for binary files or newly created/deleted files.
-func estimateBinaryOrNewFileChange(branch1, branch2, file string) int {
-	// Get file size in bytes from both branches
-	size1 := getFileSize(branch1, file)
-	size2 := getFileSize(branch2, file)
-
-	sizeChange := abs(size2 - size1)
-
-	// Estimate number of lines based on size change
-	estimatedLines := sizeChange / 100 // Rough estimate: 100 bytes per line
-	if estimatedLines == 0 {
-		estimatedLines = 1 // Minimum change of 1 line
-	}
-
-	return estimatedLines
-}
-
-// getFileSize returns the file size in bytes for a given branch and file.
-func getFileSize(branch, file string) int {
-	out, err := exec.Command("git", "cat-file", "-s", branch+":"+file).Output()
-	if err != nil {
-		return 0 // Assume deleted or new file
-	}
-	size, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil {
-		return 0
-	}
-	return size
-}
-
-// abs returns the absolute value of an integer.
-func abs(x int) int {
-	if x < 0 {
-		return -x
-	}
-	return x
+	return changedLines, nil
 }
